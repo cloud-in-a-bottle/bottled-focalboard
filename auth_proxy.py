@@ -1,17 +1,22 @@
 """OpenHost auth-proxy sidecar for Focalboard (single-user mode).
 
-Sits between the OpenHost router and Focalboard.  Verifies the
-visitor's ``zone_auth`` JWT cookie (signed by the OpenHost router
-with RS256, published at ``/.well-known/jwks.json`` on the router)
-and only forwards requests when the claim ``sub == "owner"``.
+Sits between the OpenHost router and Focalboard.  Trusts the
+OpenHost router's ``X-OpenHost-Is-Owner: true`` header as the sole
+authentication signal: the router stamps that header AFTER
+JWT-verifying the visitor's ``zone_auth`` cookie (RS256, signed
+by the router itself), and strips any client-supplied versions
+before stamping its own.  Combined with our ``public_paths = []``
+in openhost.toml, this means anonymous traffic never reaches us —
+the router 302s anonymous visitors to the zone /login page and we
+only ever see authenticated requests.
 
 For owner requests with no ``FOCALBOARDAUTHTOKEN`` cookie yet, the
-proxy 302's the browser back to the same URL with the cookie set
+proxy 303's the browser back to the same URL with the cookie set
 to the configured single-user token.  Subsequent requests carry
-the cookie and pass through to focalboard-server, which (in single-
-user mode) accepts any request that presents the configured token
-either as the ``FOCALBOARDAUTHTOKEN`` cookie or as
-``Authorization: Bearer ...``.
+the cookie and pass through to focalboard-server, which (in
+single-user mode) accepts any request presenting the configured
+token via the ``FOCALBOARDAUTHTOKEN`` cookie or the
+``Authorization: Bearer ...`` header.
 
 Defence-in-depth: the proxy ALSO injects
 ``Authorization: Bearer <token>`` on every forwarded request, so
@@ -20,42 +25,38 @@ ITP, an aggressive privacy extension, ...) the request still
 authenticates.  The two paths are independent and both terminate
 at the same single-user-token check inside Focalboard.
 
-Why a hard JWKS gate instead of a stamped header (forgejo /
-miniflux pattern)?  Focalboard in single-user mode has no per-
-user model — there's just "the owner" and not-the-owner.  Any
-authenticated owner is the only person who has any business
-touching it; everyone else gets 403 from us with no upstream
-forwarding.
+Defence-in-depth (the other direction): the proxy ALWAYS strips
+client-supplied ``X-OpenHost-Is-Owner`` and ``X-OpenHost-User``
+headers on inbound requests before checking the router-stamped
+versions.  The OpenHost router does this strip too, so we'd have
+to be both bypassed AND a hostile client injecting forged
+headers for this to matter, but stripping again costs nothing
+and closes the loop.
 
 WebSocket support: Focalboard's SPA opens a WebSocket to
-``/ws/onchange`` for live board updates (cards moving, others'
-cursors).  We detect the upgrade and switch to bidirectional byte
-forwarding, mirroring the openhost-peertube + openhost-jenkins
-auth-proxies.  The WS upgrade request itself is JWT-gated like any
-other request, so non-owners can't sneak in a WS handshake.
+``/ws/onchange`` for live board updates.  We detect the upgrade
+and switch to bidirectional byte forwarding, mirroring
+openhost-peertube + openhost-jenkins.  The WS upgrade request is
+gated like any other request, so non-owners can't sneak in.
 
-One path bypasses the JWT check:
+Why trust the router's stamp instead of re-verifying the JWT
+ourselves (the openhost-syncthing pattern)?  The syncthing app
+has ``public_paths = ["/_some_path"]`` so the router lets some
+anonymous traffic through and the proxy must enforce auth itself.
+Focalboard in single-user mode has no anonymous surface — every
+path is owner-only — so ``public_paths = []`` is the right fit
+and the router's stamp is sufficient.  This matches
+openhost-minio's design.
 
-  * ``/_healthz`` is served locally by the proxy itself (no
-    upstream forward) for the OpenHost router's wait-for-ready
-    probe.  Returns 200 the moment the proxy binds, before
-    focalboard-server is ready.  Without this, the router's probe
-    polls focalboard's "/" which redirects to ``/login`` until
-    the operator visits, and the router can interpret the 3xx
-    chain as "container failed to start" and kill us during cold
-    boot.
+This proxy is adapted from openhost-minio/auth_proxy.py (trust
+the router's stamp + cookie-set on first visit) and
+openhost-peertube's WS handler.  The differences from minio are:
 
-Implementation derives directly from
-openhost-syncthing/auth_proxy.py — same JWKS cache, same body-
-buffering, same hop-by-hop header handling.  Differences:
-
-  * Cookie-set 302 path on first owner visit (vs syncthing's
-    "no app session" model where every request is JWT-gated).
-  * WebSocket bidirectional forwarding (syncthing has no WS
-    surface).
-  * ``/_healthz`` served locally (vs syncthing's
-    ``/rest/noauth/health`` upstream pass-through).
-  * Cookie + Authorization injection on forwarded requests.
+  * Static cookie value (the configured single-user token) vs
+    minio's API-call-and-capture-Set-Cookie.
+  * ``/_healthz`` served locally (minio has no equivalent).
+  * Cookie + Authorization injection on forwarded requests (minio
+    only sets the cookie once via 302).
 """
 
 from __future__ import annotations
@@ -66,13 +67,8 @@ import os
 import selectors
 import socket
 import sys
-import threading
-import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import AbstractSet, Iterable
-
-import jwt
-import requests
 
 # -- Constants -----------------------------------------------------
 
@@ -82,10 +78,6 @@ import requests
 # pre-stamped came from the client and is not to be trusted.
 OWNER_HEADER_NAME = "X-OpenHost-Is-Owner"
 USER_HEADER_NAME = "X-OpenHost-User"
-
-ZONE_COOKIE = "zone_auth"
-JWKS_PATH = "/.well-known/jwks.json"
-JWKS_REFRESH_INTERVAL_SEC = 600  # 10 minutes
 
 # Focalboard's session cookie name (server/services/auth/request_parser.go).
 # Single-user mode treats any value other than the configured
@@ -156,86 +148,6 @@ logging.basicConfig(
 log = logging.getLogger("auth_proxy")
 
 
-# -- JWKS cache ----------------------------------------------------
-
-
-class JwksCache:
-    """Fetches the OpenHost router's JWKS and caches it with stale fallback.
-
-    On a successful fetch the keys are cached for
-    ``JWKS_REFRESH_INTERVAL_SEC``; on a failed refresh we keep
-    serving previously-cached keys so a transient router outage
-    doesn't lock the owner out.  Same shape as
-    openhost-miniflux/openhost-syncthing's caches.
-    """
-
-    def __init__(self, router_url: str) -> None:
-        self._router_url = router_url.rstrip("/")
-        self._keys: list = []
-        self._fetched_at: float = 0.0
-        self._cache_lock = threading.Lock()
-        self._fetch_lock = threading.Lock()
-
-    def _fetch(self) -> list:
-        url = f"{self._router_url}{JWKS_PATH}"
-        with requests.get(url, timeout=5) as resp:
-            resp.raise_for_status()
-            jwks = resp.json()
-        keys = []
-        skipped = 0
-        for jwk in jwks.get("keys", []):
-            try:
-                key = jwt.algorithms.RSAAlgorithm.from_jwk(jwk)
-            except Exception as exc:  # noqa: BLE001
-                skipped += 1
-                kid = jwk.get("kid") if isinstance(jwk, dict) else None
-                log.warning("skipping malformed JWK (kid=%s): %s", kid, exc)
-                continue
-            keys.append(key)
-        if not keys:
-            raise RuntimeError(
-                f"router JWKS contains no usable keys (skipped {skipped})"
-            )
-        return keys
-
-    def get(self) -> list:
-        with self._cache_lock:
-            cached_keys = self._keys
-            cached_at = self._fetched_at
-        if cached_keys and (time.time() - cached_at) < JWKS_REFRESH_INTERVAL_SEC:
-            return cached_keys
-
-        with self._fetch_lock:
-            with self._cache_lock:
-                cached_keys = self._keys
-                cached_at = self._fetched_at
-            if cached_keys and (time.time() - cached_at) < JWKS_REFRESH_INTERVAL_SEC:
-                return cached_keys
-
-            try:
-                keys = self._fetch()
-            except Exception as exc:  # noqa: BLE001 - log+fallback
-                if cached_keys:
-                    log.warning(
-                        "JWKS refresh failed, using cached keys: %s", exc
-                    )
-                    return cached_keys
-                log.warning("JWKS fetch failed and no cache: %s", exc)
-                raise
-
-            with self._cache_lock:
-                self._keys = keys
-                self._fetched_at = time.time()
-            log.info("refreshed JWKS (%d key(s))", len(keys))
-            return keys
-
-    def prefetch(self) -> None:
-        try:
-            self.get()
-        except Exception as exc:  # noqa: BLE001
-            log.warning("initial JWKS prefetch failed (will retry on demand): %s", exc)
-
-
 # -- Helpers -------------------------------------------------------
 
 
@@ -255,31 +167,6 @@ def _parse_cookie_header(cookie_header: str | None) -> dict[str, str]:
         name, value = part.split("=", 1)
         result.setdefault(name.strip(), value.strip())
     return result
-
-
-def _verify_owner(token: str, jwks: JwksCache) -> bool:
-    """Return True iff `token` is a valid router-signed owner JWT."""
-    if not token:
-        return False
-    try:
-        keys = jwks.get()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("JWKS unavailable; denying owner check: %s", exc)
-        return False
-
-    for key in keys:
-        try:
-            claims = jwt.decode(
-                token,
-                key,
-                algorithms=["RS256"],
-                options={"require": ["exp"], "verify_aud": False},
-            )
-        except jwt.PyJWTError:
-            continue
-        if claims.get("sub") == "owner":
-            return True
-    return False
 
 
 def _strip_headers(
@@ -358,7 +245,6 @@ def _build_set_cookie(token: str, secure: bool) -> str:
 
 class AuthProxyHandler(BaseHTTPRequestHandler):
     # Set by main() before the server starts.
-    jwks: JwksCache | None = None
     upstream_host: str = "127.0.0.1"
     upstream_port: int = 8000
     token_file: str = "/data/app_data/focalboard/config/single-user-token.txt"
@@ -414,24 +300,27 @@ class AuthProxyHandler(BaseHTTPRequestHandler):
             self._serve_healthz()
             return
 
-        # Auth gate.  Every non-health path requires an owner JWT.
-        if self.jwks is None:
-            log.error("auth-proxy JWKS not initialised; refusing request")
-            self._safe_send_error(503, "auth-proxy not initialised")
-            return
-        cookies = _parse_cookie_header(self.headers.get("Cookie"))
-        token = cookies.get(ZONE_COOKIE, "")
-        if not _verify_owner(token, self.jwks):
+        # Auth gate.  Trust the router's stamp: anonymous traffic
+        # never reaches us (router 302's to /login first), so any
+        # request that arrives here without X-OpenHost-Is-Owner:
+        # true is either (a) bypassing the router (impossible in
+        # production, and our defence-in-depth strips client-
+        # supplied versions of the header anyway) or (b) a router
+        # bug.  Either way, refuse.
+        is_owner = (
+            self.headers.get(OWNER_HEADER_NAME, "").lower() == "true"
+        )
+        if not is_owner:
             # 403 not 401: 401 invites the browser to pop a basic-
             # auth dialog, but our auth flow is the OpenHost
-            # zone_auth cookie, not basic auth.  Returning 403 is
-            # consistent with the router's own behaviour for
-            # unauthenticated requests on protected paths.
+            # zone_auth cookie / API token, not basic auth.
             self._safe_send_error(403, "Forbidden")
             return
 
+        cookies = _parse_cookie_header(self.headers.get("Cookie"))
+
         # The owner's first request to any path: if there's no
-        # FOCALBOARDAUTHTOKEN cookie yet, set it via 302 to the
+        # FOCALBOARDAUTHTOKEN cookie yet, set it via 303 to the
         # same URL.  Subsequent requests carry the cookie.
         if FOCALBOARD_COOKIE not in cookies:
             single_user_token = _read_token_file(self.token_file)
@@ -808,15 +697,6 @@ def _port_from_env(name: str, default: int) -> int:
 
 
 def main() -> int:
-    router_url = os.environ.get("OPENHOST_ROUTER_URL", "").strip()
-    if not router_url:
-        log.error(
-            "OPENHOST_ROUTER_URL is not set; refusing to start "
-            "(this is normally injected by compute_space at "
-            "container start)"
-        )
-        return 1
-
     try:
         listen_port = _port_from_env("AUTH_PROXY_LISTEN_PORT", 8090)
         upstream_port = _port_from_env("AUTH_PROXY_UPSTREAM_PORT", 8000)
@@ -832,10 +712,6 @@ def main() -> int:
         or "/data/app_data/focalboard/config/single-user-token.txt"
     )
 
-    jwks = JwksCache(router_url)
-    jwks.prefetch()
-
-    AuthProxyHandler.jwks = jwks
     AuthProxyHandler.upstream_host = upstream_host
     AuthProxyHandler.upstream_port = upstream_port
     AuthProxyHandler.token_file = token_file
@@ -852,11 +728,10 @@ def main() -> int:
         )
         return 1
     log.info(
-        "listening on 0.0.0.0:%d -> %s:%d (router=%s, token_file=%s)",
+        "listening on 0.0.0.0:%d -> %s:%d (token_file=%s)",
         listen_port,
         upstream_host,
         upstream_port,
-        router_url,
         token_file,
     )
     try:

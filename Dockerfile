@@ -52,15 +52,15 @@ FROM docker.io/mattermost/focalboard:7.11.4 AS focalboard-source
 
 # Stage 2: build the runtime image.
 #
-# python:3.13-slim has Python (for the auth-proxy + JWKS cache),
-# bash + coreutils (for start.sh's first-boot token generator),
-# and ca-certificates (so the JWKS fetch over HTTPS works on
-# operator hosts where openhost-router fronts JWKS via TLS).
+# python:3.13-slim has Python (for the auth-proxy) and bash +
+# coreutils (for start.sh's first-boot token generator).  The
+# auth-proxy uses only stdlib (http.client, http.server,
+# selectors, socket) — no third-party deps — because we trust
+# the OpenHost router's owner header rather than re-verifying
+# JWTs ourselves.  Skipping `pip install` keeps the image
+# portable across operator hosts where podman+crun trips on
+# newer base images during RUN steps.
 FROM docker.io/library/python:3.13-slim
-
-# -- Python deps (PyJWT for JWKS verification, requests for the
-#    JWKS fetch).  Same set as openhost-syncthing's auth-proxy.
-RUN pip install --no-cache-dir 'pyjwt[crypto]==2.10.1' 'requests==2.32.3'
 
 # -- focalboard binary + webapp -----------------------------------
 # focalboard-server is a static Go binary; safe to lift onto a
