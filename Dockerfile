@@ -42,7 +42,13 @@
 # We pin by digest to make the build reproducible — `latest`
 # floats and could disappear if Docker Hub eventually GCs the
 # old image (the upstream repo is dormant since 2023).
-FROM mattermost/focalboard:7.11.4 AS focalboard-source
+# Use the fully-qualified docker.io path explicitly: some
+# OpenHost host configurations (rootless podman without
+# unqualified-search-registries set in /etc/containers/registries.conf)
+# refuse short-form image names with "did not resolve to an alias".
+# Pinning the registry up front avoids that whole class of
+# operator-host portability issues.
+FROM docker.io/mattermost/focalboard:7.11.4 AS focalboard-source
 
 # Stage 2: build the runtime image.
 #
@@ -50,7 +56,7 @@ FROM mattermost/focalboard:7.11.4 AS focalboard-source
 # bash + coreutils (for start.sh's first-boot token generator),
 # and ca-certificates (so the JWKS fetch over HTTPS works on
 # operator hosts where openhost-router fronts JWKS via TLS).
-FROM python:3.13-slim
+FROM docker.io/library/python:3.13-slim
 
 # -- Python deps (PyJWT for JWKS verification, requests for the
 #    JWKS fetch).  Same set as openhost-syncthing's auth-proxy.
