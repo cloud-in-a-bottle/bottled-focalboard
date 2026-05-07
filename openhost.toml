@@ -1,0 +1,69 @@
+[app]
+name = "focalboard"
+version = "0.1.0"
+description = "Focalboard — Notion-style boards, cards, and Kanban for personal task management. Runs in single-user mode with the zone owner auto-authenticated by an auth-proxy sidecar that gates every request on the OpenHost zone JWT."
+
+[runtime.container]
+# Container port 8090 is the auth-proxy sidecar.  It listens here
+# and reverse-proxies SSO-gated traffic to the focalboard-server
+# upstream on 127.0.0.1:8000.  This is the port the OpenHost
+# router routes browser traffic to (via the canonical subdomain
+# focalboard.<zone-domain>; path-prefixed <zone-domain>/focalboard/
+# also works but the dashboard links the subdomain).
+#
+# Auth model: focalboard-server is started in single-user mode
+# (-single-user CLI flag + FOCALBOARD_SINGLE_USER_TOKEN env var).
+# In that mode the server requires the configured token on every
+# API call (cookie FOCALBOARDAUTHTOKEN, or Authorization: Bearer).
+# The auth-proxy verifies the visitor's zone_auth JWT cookie
+# against the OpenHost router's published JWKS, and on the first
+# owner request it 302's the browser back to the same path with
+# the FOCALBOARDAUTHTOKEN cookie set to the configured single-
+# user token.  Subsequent requests carry the cookie and pass
+# through normally.
+#
+# The 8090 vs 8000 split is the standard OpenHost "auth-proxy
+# sidecar binds the public port; upstream binds loopback only"
+# topology — same shape as openhost-minio (9090/9001) and
+# openhost-jenkins (8080/8081).  The split is what lets us
+# reject anyone without a verified zone JWT before the
+# upstream sees a single byte.
+image = "Dockerfile"
+port = 8090
+
+[routing]
+# Focalboard's /api/v2/users/me probe is the closest thing the
+# server has to a health endpoint that responds without auth in
+# all modes.  In single-user mode it returns 200 only when a
+# valid token is supplied, so we instead use the auth-proxy's
+# own /_healthz which doesn't depend on focalboard being ready.
+# The OpenHost wait-for-ready probe will follow the auth-proxy's
+# 200 from this path.
+health_check = "/_healthz"
+# Every path is private to the zone owner.  The OpenHost router
+# enforces this at its layer (302's anonymous visitors to the
+# zone /login page) and the auth-proxy enforces it again
+# locally — defence in depth, mirroring the openhost-syncthing
+# /openhost-jenkins/openhost-forgejo pattern.
+public_paths = []
+
+[resources]
+# focalboard-server's RSS at idle is ~25 MiB; under load (heavy
+# board with many cards, multiple WS clients) it climbs to ~150
+# MiB.  The auth-proxy sidecar adds ~20 MiB.  256 MiB gives
+# comfortable headroom; bump if a deployment grows past a few
+# hundred boards.
+memory_mb = 256
+# Focalboard is largely IO-bound (sqlite writes per card edit).
+# 250m is plenty for personal-scale single-owner usage.
+cpu_millicores = 250
+
+[data]
+# Persistent: the focalboard-server sqlite DB, uploaded files,
+# and the on-disk single-user token.  Lives under
+# OPENHOST_APP_DATA_DIR (which compute_space mounts at
+# /data/app_data/focalboard inside the container).  The token
+# file persists so the cookie set on the operator's browser
+# remains valid across container restarts; deleting the file
+# rotates it (operator must clear cookie too).
+app_data = true
