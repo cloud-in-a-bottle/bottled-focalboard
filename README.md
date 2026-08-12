@@ -1,13 +1,13 @@
-# openhost-focalboard
+# bottled-focalboard
 
 [Focalboard](https://www.focalboard.com/) — Notion-style boards,
 cards, and Kanban for personal task management — packaged as an
-OpenHost app with seamless OpenHost SSO.
+Cloud in a Bottle app with seamless Cloud in a Bottle SSO.
 
 ## What you get
 
 - Focalboard running on `https://focalboard.<zone>/` with TLS
-  terminated by the OpenHost outer Caddy.
+  terminated by the Cloud in a Bottle outer Caddy.
 - The zone owner is auto-logged in to Focalboard on first visit.
   No application-level sign-in form ever appears.
 - Real-time board updates (`/ws/onchange`) work through the
@@ -75,7 +75,7 @@ password.
 The auth-proxy:
 
 1. Verifies every inbound request's `zone_auth` cookie against
-   the OpenHost router's published JWKS. Non-owners get 403.
+   the Cloud in a Bottle router's published JWKS. Non-owners get 403.
 2. On the first owner request without `FOCALBOARDAUTHTOKEN`,
    replies 303 to the same URL with the cookie set.
 3. On subsequent requests, forwards verbatim and injects
@@ -110,7 +110,7 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 The agent can use this same token to post task progress as
 cards or update card properties as work proceeds. The token
-does NOT carry an OpenHost zone_auth cookie, so requests from
+does NOT carry a Cloud in a Bottle zone_auth cookie, so requests from
 the agent skip the SSO bounce — they hit the auth-proxy, fail
 the JWT check (no cookie), and would normally 403. To allow
 agent-direct API access, the operator must either:
@@ -118,12 +118,12 @@ agent-direct API access, the operator must either:
 - Run the agent on the same host (network-namespace local-
   loopback to the upstream container port — bypasses the
   proxy entirely), or
-- Configure the OpenHost router to allow API paths through
+- Configure the Cloud in a Bottle router to allow API paths through
   with token-based auth in lieu of zone_auth (planned, not
   yet built).
 
 For now, the simplest pattern is: agent runs in the same
-zone (e.g. as another OpenHost app), uses `OPENHOST_*`
+zone (e.g. as another Cloud in a Bottle app), uses `OPENHOST_*`
 environment variables to reach focalboard's container loopback,
 and never touches the public URL.
 
@@ -141,9 +141,9 @@ $OPENHOST_APP_DATA_DIR/
 
 ## Limitations
 
-- **No multi-user mode.** Single-user is the OpenHost-friendly
+- **No multi-user mode.** Single-user is the Cloud in a Bottle-friendly
   shape; multi-user would require either fronting Focalboard
-  with an OIDC issuer (planned for OpenHost) or running it in
+  with an OIDC issuer (planned for Cloud in a Bottle) or running it in
   Mattermost-plugin mode (which embeds the boards UI inside
   Mattermost and is out of scope for a standalone app).
 - **Upstream is dormant.** Last release v7.11.4 (Aug 2023). The
