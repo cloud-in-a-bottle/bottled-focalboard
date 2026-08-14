@@ -1,7 +1,7 @@
 [app]
 name = "focalboard"
 version = "0.1.0"
-description = "Focalboard — Notion-style boards, cards, and Kanban for personal task management. Runs in single-user mode with the zone owner auto-authenticated by an auth-proxy sidecar that gates every request on the OpenHost zone JWT."
+description = "Focalboard — Notion-style boards, cards, and Kanban for personal task management. Runs in single-user mode with the zone owner auto-authenticated by an auth-proxy sidecar that gates every request on the Cloud in a Bottle zone JWT."
 
 [runtime.container]
 # Container port 8090 is the auth-proxy sidecar.  It listens here
